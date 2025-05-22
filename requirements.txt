@@ -1,0 +1,10 @@
+dlib
+requests
+scipy
+ninja
+gdown
+scikit-image
+ipython
+opencv-python
+scikit-learn
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
