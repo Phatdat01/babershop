@@ -61,7 +61,6 @@ parser.add_argument('--blend_steps', type=int, default=100, help='')
 
 args = parser.parse_args()
 ii2s = Embedding(args)
-align = Alignment(args)
 # model_parser = get_parser()
 # model_args, _ = model_parser.parse_known_args()
 # hair_fast = HairFast(model_args)
@@ -209,6 +208,7 @@ def get_wig():
 
             ii2s.invert_images_in_W([*im_set])
             ii2s.invert_images_in_FS([*im_set])
+            align = Alignment(args)
             final_pil_image = align.align_images_2(im_path1, im_path2, sign=args.sign, align_more_region=False, smooth=args.smooth)
 
             # Prepare response
