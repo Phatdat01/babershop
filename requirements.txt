@@ -7,4 +7,5 @@ scikit-image
 ipython
 opencv-python
 scikit-learn
+flask
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124

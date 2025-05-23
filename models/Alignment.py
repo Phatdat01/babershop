@@ -356,6 +356,145 @@ class Alignment(nn.Module):
                                        end_layer=8, layer_in=latent_F_mixed)
         self.save_align_results(im_name_1, im_name_2, sign, gen_im, latent_1, latent_F_mixed,
                                 save_intermediate=save_intermediate)
+        
+    def align_images_2(self, img_path1, img_path2, sign='realistic', align_more_region=False, smooth=5,
+                     save_intermediate=True):
+
+        ################## img_path1: Identity Image
+        ################## img_path2: Structure Image
+
+        device = self.opts.device
+        output_dir = self.opts.output_dir
+        target_mask, hair_mask_target, hair_mask1, hair_mask2 = \
+            self.create_target_segmentation_mask(img_path1=img_path1, img_path2=img_path2, sign=sign,
+                                                 save_intermediate=save_intermediate)
+
+        im_name_1 = os.path.splitext(os.path.basename(img_path1))[0]
+        im_name_2 = os.path.splitext(os.path.basename(img_path2))[0]
+
+        latent_FS_path_1 = os.path.join(output_dir, 'FS', f'{im_name_1}.npz')
+        latent_FS_path_2 = os.path.join(output_dir, 'FS', f'{im_name_2}.npz')
+
+        latent_1, latent_F_1 = load_FS_latent(latent_FS_path_1, device)
+        latent_2, latent_F_2 = load_FS_latent(latent_FS_path_2, device)
+
+        latent_W_path_1 = os.path.join(output_dir, 'W+', f'{im_name_1}.npy')
+        latent_W_path_2 = os.path.join(output_dir, 'W+', f'{im_name_2}.npy')
+
+        optimizer_align, latent_align_1 = self.setup_align_optimizer(latent_W_path_1)
+
+        pbar = tqdm(range(self.opts.align_steps1), desc='Align Step 1', leave=False)
+        for step in pbar:
+            optimizer_align.zero_grad()
+            latent_in = torch.cat([latent_align_1[:, :6, :], latent_1[:, 6:, :]], dim=1)
+            down_seg, _ = self.create_down_seg(latent_in)
+
+            loss_dict = {}
+            ##### Cross Entropy Loss
+            ce_loss = self.loss_builder.cross_entropy_loss(down_seg, target_mask)
+            loss_dict["ce_loss"] = ce_loss.item()
+            loss = ce_loss
+
+            # best_summary = f'BEST ({j+1}) | ' + ' | '.join(
+            #     [f'{x}: {y:.4f}' for x, y in loss_dict.items()])
+
+            #### TODO not finished
+
+            loss.backward()
+            optimizer_align.step()
+
+        intermediate_align, _ = self.net.generator([latent_in], input_is_latent=True, return_latents=False,
+                                                   start_layer=0, end_layer=3)
+        intermediate_align = intermediate_align.clone().detach()
+
+        ##############################################
+
+        optimizer_align, latent_align_2 = self.setup_align_optimizer(latent_W_path_2)
+
+        with torch.no_grad():
+            tmp_latent_in = torch.cat([latent_align_2[:, :6, :], latent_2[:, 6:, :]], dim=1)
+            down_seg_tmp, I_Structure_Style_changed = self.create_down_seg(tmp_latent_in)
+
+            current_mask_tmp = torch.argmax(down_seg_tmp, dim=1).long()
+            HM_Structure = torch.where(current_mask_tmp == 10, torch.ones_like(current_mask_tmp),
+                                       torch.zeros_like(current_mask_tmp))
+            HM_Structure = F.interpolate(HM_Structure.float().unsqueeze(0), size=(256, 256), mode='nearest')
+
+        pbar = tqdm(range(self.opts.align_steps2), desc='Align Step 2', leave=False)
+        for step in pbar:
+            optimizer_align.zero_grad()
+            latent_in = torch.cat([latent_align_2[:, :6, :], latent_2[:, 6:, :]], dim=1)
+            down_seg, gen_im = self.create_down_seg(latent_in)
+
+            Current_Mask = torch.argmax(down_seg, dim=1).long()
+            HM_G_512 = torch.where(Current_Mask == 10, torch.ones_like(Current_Mask),
+                                   torch.zeros_like(Current_Mask)).float().unsqueeze(0)
+            HM_G = F.interpolate(HM_G_512, size=(256, 256), mode='nearest')
+
+            loss_dict = {}
+
+            ########## Segmentation Loss
+            ce_loss = self.loss_builder.cross_entropy_loss(down_seg, target_mask)
+            loss_dict["ce_loss"] = ce_loss.item()
+            loss = ce_loss
+
+            #### Style Loss
+            H1_region = self.downsample_256(I_Structure_Style_changed) * HM_Structure
+            H2_region = self.downsample_256(gen_im) * HM_G
+            style_loss = self.loss_builder.style_loss(H1_region, H2_region, mask1=HM_Structure, mask2=HM_G)
+
+            loss_dict["style_loss"] = style_loss.item()
+            loss += style_loss
+
+            # best_summary = f'BEST ({j+1}) | ' + ' | '.join(
+            #     [f'{x}: {y:.4f}' for x, y in loss_dict.items()])
+
+            loss.backward()
+            optimizer_align.step()
+
+        latent_F_out_new, _ = self.net.generator([latent_in], input_is_latent=True, return_latents=False,
+                                                 start_layer=0, end_layer=3)
+        latent_F_out_new = latent_F_out_new.clone().detach()
+
+        free_mask = 1 - (1 - hair_mask1.unsqueeze(0)) * (1 - hair_mask_target)
+
+        ##############################
+        free_mask, _ = self.dilate_erosion(free_mask, device, dilate_erosion=smooth)
+        ##############################
+
+        free_mask_down_32 = F.interpolate(free_mask.float(), size=(32, 32), mode='bicubic')[0]
+        interpolation_low = 1 - free_mask_down_32
+
+
+        latent_F_mixed = intermediate_align + interpolation_low.unsqueeze(0) * (
+                latent_F_1 - intermediate_align)
+
+        if not align_more_region:
+            free_mask = hair_mask_target
+            ##########################
+            _, free_mask = self.dilate_erosion(free_mask, device, dilate_erosion=smooth)
+            ##########################
+            free_mask_down_32 = F.interpolate(free_mask.float(), size=(32, 32), mode='bicubic')[0]
+            interpolation_low = 1 - free_mask_down_32
+
+
+        latent_F_mixed = latent_F_out_new + interpolation_low.unsqueeze(0) * (
+                latent_F_mixed - latent_F_out_new)
+
+        free_mask = F.interpolate((hair_mask2.unsqueeze(0) * hair_mask_target).float(), size=(256, 256), mode='nearest').cuda()
+        ##########################
+        _, free_mask = self.dilate_erosion(free_mask, device, dilate_erosion=smooth)
+        ##########################
+        free_mask_down_32 = F.interpolate(free_mask.float(), size=(32, 32), mode='bicubic')[0]
+        interpolation_low = 1 - free_mask_down_32
+
+        latent_F_mixed = latent_F_2 + interpolation_low.unsqueeze(0) * (
+                latent_F_mixed - latent_F_2)
+
+        gen_im, _ = self.net.generator([latent_1], input_is_latent=True, return_latents=False, start_layer=4,
+                                       end_layer=8, layer_in=latent_F_mixed)
+        save_im = toPIL(((gen_im[0] + 1) / 2).detach().cpu().clamp(0, 1))
+        return save_im
 
     def save_align_results(self, im_name_1, im_name_2, sign, gen_im, latent_in, latent_F, save_intermediate=True):
 
